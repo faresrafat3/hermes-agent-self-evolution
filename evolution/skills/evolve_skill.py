@@ -30,7 +30,7 @@ from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.openrouter_keys import key_fingerprint
-from evolution.core.openrouter_rotation import make_rotating_lm
+from evolution.core.openrouter_rotation import RotatingLM, make_rotating_lm
 from evolution.skills.skill_module import (
     SkillModule,
     extract_skill_markdown,
@@ -39,6 +39,32 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+
+def build_reflection_lm(
+    *,
+    task_lm: RotatingLM,
+    task_model: str,
+    optimizer_model: str,
+    round_robin: bool = True,
+    base_url: str | None = None,
+) -> RotatingLM:
+    """Return the LM GEPA uses to propose the next candidate.
+
+    When ``optimizer_model`` names a different model than the task model, a
+    dedicated :class:`RotatingLM` is built for it, so reflections ride the
+    same eleven-key rotation and the fallback token cap as every other call.
+    When it is unset or equal to the task model, ``task_lm`` is reused -- a
+    second LM on the same route would only double the round-robin traffic
+    for no gain.
+    """
+    if not optimizer_model or optimizer_model == task_model:
+        return task_lm
+    return make_rotating_lm(
+        optimizer_model,
+        round_robin=round_robin,
+        base_url=base_url,
+    )
 
 
 def evolve(
@@ -151,20 +177,31 @@ def evolve(
     # RotatingLM round-robins across OPENROUTER_API_KEY[_2.._11] and
     # rotates on rate-limit / quota errors, falling back to the beam model
     # once every key is exhausted on the primary model.
+    # Two distinct lanes: the task LM scores candidates (eval_model); the
+    # reflection LM proposes the next candidate (optimizer_model). They are
+    # the same object only when the caller did not split the models.
     fallback = FREE_FALLBACK_MODEL if eval_model != FREE_FALLBACK_MODEL else None
-    lm = make_rotating_lm(
+    task_lm = make_rotating_lm(
         eval_model,
         fallback_model=fallback,
         round_robin=config.openrouter_round_robin,
         base_url=OPENROUTER_BASE_URL,
     )
+    reflection_lm = build_reflection_lm(
+        task_lm=task_lm,
+        task_model=eval_model,
+        optimizer_model=optimizer_model,
+        round_robin=config.openrouter_round_robin,
+        base_url=OPENROUTER_BASE_URL,
+    )
     console.print(
-        f"  OpenRouter keys: {len(lm.key_pool)} configured "
-        f"(current {key_fingerprint(lm.key_pool.current_key)}), "
+        f"  OpenRouter keys: {len(task_lm.key_pool)} configured "
+        f"(current {key_fingerprint(task_lm.key_pool.current_key)}), "
         f"round-robin={config.openrouter_round_robin}, "
         f"fallback={fallback or 'none'}"
     )
-    dspy.configure(lm=lm)
+    console.print(f"  Reflection model: {reflection_lm.model}")
+    dspy.configure(lm=task_lm)
 
     # Create the baseline skill module. The skill body becomes the predictor's
     # signature instructions -- the text GEPA evolves -- while the original
@@ -188,7 +225,7 @@ def evolve(
         optimizer = dspy.GEPA(
             metric=skill_fitness_metric,
             max_full_evals=iterations,
-            reflection_lm=lm,
+            reflection_lm=reflection_lm,
         )
 
         optimized_module = optimizer.compile(
@@ -248,7 +285,7 @@ def evolve(
     evolved_scores = []
     for ex in holdout_examples:
         # Score baseline
-        with dspy.context(lm=lm):
+        with dspy.context(lm=task_lm):
             baseline_pred = baseline_module(task_input=ex.task_input)
             baseline_score = skill_fitness_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
@@ -315,11 +352,11 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
-        "openrouter_key_count": len(lm.key_pool),
-        "openrouter_key_fingerprints": lm.key_pool.fingerprints(),
-        "openrouter_rotations": lm.key_pool.rotations,
-        "openrouter_rate_limit_hits": lm.key_pool.rate_limit_hits,
-        "openrouter_successful_calls": lm.key_pool.successful_calls,
+        "openrouter_key_count": len(task_lm.key_pool),
+        "openrouter_key_fingerprints": task_lm.key_pool.fingerprints(),
+        "openrouter_rotations": task_lm.key_pool.rotations,
+        "openrouter_rate_limit_hits": task_lm.key_pool.rate_limit_hits,
+        "openrouter_successful_calls": task_lm.key_pool.successful_calls,
         "fallback_model": fallback,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
