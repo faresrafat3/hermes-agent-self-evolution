@@ -31,6 +31,7 @@ from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.openrouter_keys import key_fingerprint
 from evolution.core.openrouter_rotation import RotatingLM, make_rotating_lm
+from evolution.skills.ockham import enforce_skill_growth_budget
 from evolution.skills.skill_module import (
     SkillModule,
     extract_skill_markdown,
@@ -248,7 +249,28 @@ def evolve(
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
-    # ── 6. Extract evolved skill text ───────────────────────────────────
+    # ── 6. Ockham budget enforcement ──────────────────────────────────
+    # GEPA's proposer is additively biased: it inflates the body with
+    # restated filler instead of terse rules, and the growth guard below
+    # used to discard the whole candidate on sight. Distill the evolved
+    # instructions down to the growth budget *before* validation, so a
+    # better-but-fatter candidate is compressed into compliance instead of
+    # being thrown away (the measured +240% incident, 2,036 → 7,894
+    # chars vs a 20% cap).
+    ockham_report = enforce_skill_growth_budget(
+        cast(SkillModule, optimized_module),
+        max_growth_ratio=config.max_prompt_growth,
+        baseline_text=skill["raw"],
+    )
+    if ockham_report["applied"]:
+        console.print(
+            "[yellow]⚠ Ockham budget enforced: distilled "
+            f"{ockham_report['before_size']:,} → {ockham_report['after_size']:,} chars "
+            f"(growth {ockham_report['before_growth']:+.1%} → "
+            f"{ockham_report['after_growth']:+.1%}, cap {config.max_prompt_growth:+.0%})[/yellow]"
+        )
+
+    # ── 7. Extract evolved skill text ─────────────────────────────────
     # GEPA writes the evolved instructions back into the predictor signature
     # (pred.signature = pred.signature.with_instructions(...)), so read the body
     # from there and reassemble the file with the original frontmatter when the
@@ -352,6 +374,12 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "ockham_applied": ockham_report["applied"],
+        "ockham_before_size": ockham_report["before_size"],
+        "ockham_after_size": ockham_report["after_size"],
+        "ockham_before_growth": ockham_report["before_growth"],
+        "ockham_after_growth": ockham_report["after_growth"],
+        "ockham_max_growth_ratio": ockham_report["max_growth_ratio"],
         "openrouter_key_count": len(task_lm.key_pool),
         "openrouter_key_fingerprints": task_lm.key_pool.fingerprints(),
         "openrouter_rotations": task_lm.key_pool.rotations,

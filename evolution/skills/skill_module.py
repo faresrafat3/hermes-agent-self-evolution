@@ -162,6 +162,8 @@ def extract_skill_markdown(
     module: SkillModule,
     frontmatter: Optional[str] = None,
     original_raw: Optional[str] = None,
+    max_growth_ratio: Optional[float] = None,
+    baseline_text: Optional[str] = None,
 ) -> str:
     """Extract the current SKILL.md text from a (possibly optimized) SkillModule.
 
@@ -171,12 +173,25 @@ def extract_skill_markdown(
     verbatim. If they changed, the evolved instructions are reassembled with the
     original YAML frontmatter, so name/description/metadata survive intact.
 
+    Ockham budget: when ``max_growth_ratio`` is given, a changed body that
+    would push the reassembled markdown past that fractional growth over the
+    baseline (``baseline_text`` or the module's original raw file) is
+    deterministically distilled via
+    :func:`evolution.skills.ockham.ockham_extract_markdown` so the extracted
+    skill complies with the growth cap *instead of* reverting to the old
+    text -- evolved rules survive in compressed form, frontmatter intact.
+
     Args:
         module: The SkillModule to read (baseline or GEPA-optimized).
         frontmatter: Optional frontmatter override. Defaults to the frontmatter
             captured when the module was constructed.
         original_raw: Optional original raw SKILL.md override. Defaults to the
             raw text captured when the module was constructed.
+        max_growth_ratio: Optional Ockham growth cap. When set, the returned
+            markdown is guaranteed to be within this fractional growth of the
+            baseline.
+        baseline_text: Optional baseline markdown the growth cap is measured
+            against. Defaults to ``original_raw`` / the module's original raw.
 
     Returns:
         The full SKILL.md content: original YAML frontmatter + current body.
@@ -190,4 +205,17 @@ def extract_skill_markdown(
     if evolved_body == module.original_body and raw is not None:
         return raw
 
-    return reassemble_skill(fm, evolved_body)
+    markdown = reassemble_skill(fm, evolved_body)
+
+    if max_growth_ratio is not None:
+        baseline = baseline_text if baseline_text is not None else raw
+        if baseline is None:
+            raise ValueError(
+                "max_growth_ratio needs a baseline: pass baseline_text "
+                "or construct the module with raw_skill=..."
+            )
+        from evolution.skills.ockham import ockham_extract_markdown
+
+        markdown = ockham_extract_markdown(markdown, fm, baseline, max_growth_ratio)
+
+    return markdown
