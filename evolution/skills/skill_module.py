@@ -3,6 +3,12 @@
 The key abstraction: a skill file becomes a parameterized DSPy module
 where the skill text is the optimizable parameter. GEPA can then
 mutate the skill text and evaluate the results.
+
+The optimizable text lives in ``SkillModule.predictor.signature.instructions``.
+That is the exact attribute GEPA reads as the seed candidate and writes back
+with ``pred.signature = pred.signature.with_instructions(...)`` after every
+reflective proposal, so the evolved text can be read back from the compiled
+module instead of being lost in a plain Python attribute.
 """
 
 import re
@@ -84,11 +90,17 @@ def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
 class SkillModule(dspy.Module):
     """A DSPy module that wraps a skill file for optimization.
 
-    The skill text (body) is the parameter that GEPA optimizes.
-    On each forward pass, the module:
-    1. Uses the skill text as instructions
+    The skill text is the parameter GEPA optimizes, so it is stored in the
+    predictor's signature instructions -- the attribute GEPA mutates -- rather
+    than in a plain Python attribute that no optimizer can see. On each forward
+    pass, the module:
+    1. Uses the skill text as the predictor's instructions
     2. Processes the task input
     3. Returns the agent's response
+
+    ``frontmatter`` and ``raw_skill`` are captured at construction so
+    :func:`extract_skill_markdown` can compare the evolved instructions against
+    the original body and reassemble the file with the original YAML header.
     """
 
     class TaskWithSkill(dspy.Signature):
@@ -97,20 +109,43 @@ class SkillModule(dspy.Module):
         You are an AI agent following specific skill instructions to complete a task.
         Read the skill instructions carefully and follow the procedure described.
         """
-        skill_instructions: str = dspy.InputField(desc="The skill instructions to follow")
         task_input: str = dspy.InputField(desc="The task to complete")
         output: str = dspy.OutputField(desc="Your response following the skill instructions")
 
-    def __init__(self, skill_text: str):
+    def __init__(
+        self,
+        skill_text: str,
+        frontmatter: str = "",
+        raw_skill: Optional[str] = None,
+    ):
         super().__init__()
-        self.skill_text = skill_text
-        self.predictor = dspy.ChainOfThought(self.TaskWithSkill)
+        self.frontmatter = frontmatter
+        self.original_raw = raw_skill
+        self.predictor = dspy.Predict(self.TaskWithSkill)
+        # The skill body is the predictor's instructions: this is the text GEPA
+        # evolves. Do not mirror it into a plain attribute -- a copy would not
+        # track the optimizer's updates.
+        signature = self.predictor.signature
+        assert signature is not None
+        self.predictor.signature = signature.with_instructions(skill_text)
+        # DSPy normalizes signature instructions (trims edge whitespace), so
+        # capture the normalized text as the baseline: the unchanged check in
+        # extract_skill_markdown must compare against the form GEPA sees.
+        self.original_body = self.skill_text
+
+    @property
+    def skill_text(self) -> str:
+        """The current skill instructions held by the predictor signature.
+
+        Reads ``predictor.signature.instructions`` so the value reflects GEPA's
+        evolved text after ``compile`` instead of the original body.
+        """
+        signature = self.predictor.signature
+        assert signature is not None
+        return getattr(signature, "instructions")
 
     def forward(self, task_input: str) -> dspy.Prediction:
-        result = self.predictor(
-            skill_instructions=self.skill_text,
-            task_input=task_input,
-        )
+        result = self.predictor(task_input=task_input)
         return dspy.Prediction(output=result.output)
 
 
@@ -121,3 +156,38 @@ def reassemble_skill(frontmatter: str, evolved_body: str) -> str:
     and replaces only the body with the evolved version.
     """
     return f"---\n{frontmatter}\n---\n\n{evolved_body}\n"
+
+
+def extract_skill_markdown(
+    module: SkillModule,
+    frontmatter: Optional[str] = None,
+    original_raw: Optional[str] = None,
+) -> str:
+    """Extract the current SKILL.md text from a (possibly optimized) SkillModule.
+
+    The skill body is read from ``module.predictor.signature.instructions`` --
+    the attribute GEPA rewrites. If those instructions are unchanged from the
+    module's initial skill text, the original raw file content is returned
+    verbatim. If they changed, the evolved instructions are reassembled with the
+    original YAML frontmatter, so name/description/metadata survive intact.
+
+    Args:
+        module: The SkillModule to read (baseline or GEPA-optimized).
+        frontmatter: Optional frontmatter override. Defaults to the frontmatter
+            captured when the module was constructed.
+        original_raw: Optional original raw SKILL.md override. Defaults to the
+            raw text captured when the module was constructed.
+
+    Returns:
+        The full SKILL.md content: original YAML frontmatter + current body.
+    """
+    evolved_body = module.skill_text
+    fm = module.frontmatter if frontmatter is None else frontmatter
+    raw = module.original_raw if original_raw is None else original_raw
+
+    # Unchanged instructions: return the original bytes exactly rather than a
+    # re-serialization, so an unoptimized run is byte-identical to the source.
+    if evolved_body == module.original_body and raw is not None:
+        return raw
+
+    return reassemble_skill(fm, evolved_body)
