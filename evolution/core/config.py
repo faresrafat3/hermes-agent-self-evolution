@@ -5,6 +5,13 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
+from evolution.core.openrouter_keys import (
+    DEFAULT_FALLBACK_MODEL,
+    DEFAULT_PRIMARY_MODEL,
+    OPENROUTER_KEY_ENV_VARS,
+    get_openrouter_api_keys,
+)
+
 # The self-evolution runtime is configured to spend zero money: it runs on the
 # free models already enabled on this machine. The API keys live in the Hermes
 # profile .env, which a bare venv does not read — load it once, without
@@ -42,20 +49,35 @@ def _load_hermes_env() -> None:
 _load_hermes_env()
 
 
-# Free model routes (zero financial cost). OpenRouter is primary.
+# Free model routes. OpenRouter is primary.
 #
-# There is no second free route provisioned on this machine: the account has no
-# OpenRouter credits for paid routes, and the other `:free` candidates are
-# either not valid model IDs (meituan/longcat-2.5) or not free on this account
-# (gpt-4o-mini). The Nous endpoint cannot serve as a fallback either — it needs
-# an OPENAI_API_KEY, and only OPENROUTER_API_KEY exists here.
+# The active fleet is the single-leader + two-supporter architecture: the leader
+# is meituan/longcat-2.5:free on Nous; the supporters are
+# reflection/beam-1.0-501b-a23b:free (reasoning/review) and stealth/crouton-alpha
+# (fast operations, 1M context) on Nous and OpenRouter. nemotron and
+# north-mini-code are retired from every settings file.
 #
-# So the fallback is intentionally a DIFFERENT free model on the same working
-# route, not a different provider. If the primary model is rate-limited or
-# retired, the caller can override it explicitly with --optimizer-model /
-# --eval-model.
-FREE_PRIMARY_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
-FREE_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+# This module's LM calls are rooted at OpenRouter (see OPENROUTER_BASE_URL), so
+# the two OpenRouter-reachable supporters are wired here. `stealth/` models are
+# free ($0 pricing on OpenRouter). `reflection/beam-1.0-501b-a23b` is free only
+# on Nous (`:free` SKU); on OpenRouter it is a micro-cost route ($0.0000003/M
+# prompt), used here as the fallback because it is the strongest reviewer in the
+# fleet. `meituan/longcat-2.5:free` is a Nous-route model: reaching it needs the
+# Nous base_url plus a Nous credential, which this OpenRouter-rooted wiring does
+# not carry — pass it explicitly with --optimizer-model / --eval-model once that
+# route is wired.
+#
+# OpenRouter keys: ``~/.hermes/.env`` carries eleven keys
+# (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2 … OPENROUTER_API_KEY_11).
+# ``_load_hermes_env()`` above loads every KEY=VALUE line into
+# ``os.environ``, and :func:`evolution.core.openrouter_keys.get_openrouter_api_keys`
+# collects them in that order.  LM construction goes through
+# :func:`evolution.core.openrouter_rotation.make_rotating_lm`, which
+# round-robins across the pool after each successful call and rotates to
+# the next key immediately on a rate-limit / quota (429/402) error,
+# switching to the fallback model once every key is exhausted.
+FREE_PRIMARY_MODEL = DEFAULT_PRIMARY_MODEL
+FREE_FALLBACK_MODEL = DEFAULT_FALLBACK_MODEL
 # The openrouter/ prefix is a LiteLLM route: it must be told where the OpenAI-
 # compatible endpoint lives, otherwise dspy falls back to the provider default
 # and the key in the Hermes .env is never used. Kept overridable by the caller.
@@ -81,6 +103,17 @@ class EvolutionConfig:
     eval_model: str = FREE_PRIMARY_MODEL  # Model for LLM-as-judge scoring
     judge_model: str = FREE_PRIMARY_MODEL  # Model for dataset generation
     fallback_models: list = field(default_factory=lambda: [FREE_FALLBACK_MODEL])
+
+    # OpenRouter key rotation.  The pool is built lazily from the
+    # environment (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2 … _11, as
+    # loaded from ~/.hermes/.env) at construction time, so tests that set
+    # numbered env vars see exactly those keys.  ``openrouter_round_robin``
+    # spreads calls across the pool; rate-limit rotation is always on in
+    # RotatingLM — these flags are recorded here for observability and
+    # for callers that want to disable round-robin spreading.
+    openrouter_api_keys: list = field(default_factory=get_openrouter_api_keys)
+    openrouter_key_rotation: bool = True
+    openrouter_round_robin: bool = True
 
     # Constraints
     max_skill_size: int = 15_000  # 15KB default

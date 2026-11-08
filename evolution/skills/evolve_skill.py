@@ -29,6 +29,8 @@ from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset,
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.openrouter_keys import key_fingerprint
+from evolution.core.openrouter_rotation import make_rotating_lm
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -144,9 +146,24 @@ def evolve(
     console.print(f"  Eval model: {eval_model}")
 
     # Configure DSPy — the openrouter/ route is a LiteLLM alias and needs the
-    # OpenAI-compatible endpoint explicitly, or dspy uses the provider default
+    # OpenAI-compatible endpoint explicitly, or dspy falls back to the provider default
     # and the free route silently never carries the call.
-    lm = dspy.LM(eval_model, base_url=OPENROUTER_BASE_URL)
+    # RotatingLM round-robins across OPENROUTER_API_KEY[_2.._11] and
+    # rotates on rate-limit / quota errors, falling back to the beam model
+    # once every key is exhausted on the primary model.
+    fallback = FREE_FALLBACK_MODEL if eval_model != FREE_FALLBACK_MODEL else None
+    lm = make_rotating_lm(
+        eval_model,
+        fallback_model=fallback,
+        round_robin=config.openrouter_round_robin,
+        base_url=OPENROUTER_BASE_URL,
+    )
+    console.print(
+        f"  OpenRouter keys: {len(lm.key_pool)} configured "
+        f"(current {key_fingerprint(lm.key_pool.current_key)}), "
+        f"round-robin={config.openrouter_round_robin}, "
+        f"fallback={fallback or 'none'}"
+    )
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -289,6 +306,12 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "openrouter_key_count": len(lm.key_pool),
+        "openrouter_key_fingerprints": lm.key_pool.fingerprints(),
+        "openrouter_rotations": lm.key_pool.rotations,
+        "openrouter_rate_limit_hits": lm.key_pool.rate_limit_hits,
+        "openrouter_successful_calls": lm.key_pool.successful_calls,
+        "fallback_model": fallback,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
