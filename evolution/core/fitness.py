@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from evolution.core.config import EvolutionConfig
+from evolution.core.openrouter_rotation import make_rotating_lm
 
 
 @dataclass
@@ -72,7 +73,17 @@ class LLMJudge:
     ) -> FitnessScore:
         """Score an agent output using LLM-as-judge."""
 
-        lm = dspy.LM(self.config.eval_model)
+        fallback = (
+            self.config.fallback_models[0]
+            if getattr(self.config, "fallback_models", None)
+            and self.config.fallback_models[0] != self.config.eval_model
+            else None
+        )
+        lm = make_rotating_lm(
+            self.config.eval_model,
+            fallback_model=fallback,
+            round_robin=getattr(self.config, "openrouter_round_robin", True),
+        )
 
         with dspy.context(lm=lm):
             result = self.judge(

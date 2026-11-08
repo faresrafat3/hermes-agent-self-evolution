@@ -15,6 +15,7 @@ from typing import Optional
 import dspy
 
 from evolution.core.config import EvolutionConfig
+from evolution.core.openrouter_rotation import make_rotating_lm
 
 
 @dataclass
@@ -123,7 +124,17 @@ class SyntheticDatasetBuilder:
         n = num_cases or self.config.eval_dataset_size
 
         # Configure DSPy to use the judge model for generation
-        lm = dspy.LM(self.config.judge_model)
+        fallback = (
+            self.config.fallback_models[0]
+            if getattr(self.config, "fallback_models", None)
+            and self.config.fallback_models[0] != self.config.judge_model
+            else None
+        )
+        lm = make_rotating_lm(
+            self.config.judge_model,
+            fallback_model=fallback,
+            round_robin=getattr(self.config, "openrouter_round_robin", True),
+        )
 
         with dspy.context(lm=lm):
             result = self.generator(
