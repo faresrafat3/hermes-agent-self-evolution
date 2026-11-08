@@ -19,6 +19,9 @@ datasets/**/*.json
 snapshots/
 *.pkl
 
+# Evolution run artifacts (local, not shared)
+output/
+
 # IDE
 .idea/
 .vscode/

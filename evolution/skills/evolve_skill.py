@@ -18,7 +18,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
+from evolution.core.config import (
+    FREE_FALLBACK_MODEL,
+    FREE_PRIMARY_MODEL,
+    OPENROUTER_BASE_URL,
+    EvolutionConfig,
+    resolve_hermes_agent_path,
+)
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
@@ -38,8 +44,8 @@ def evolve(
     iterations: int = 10,
     eval_source: str = "synthetic",
     dataset_path: Optional[str] = None,
-    optimizer_model: str = "openai/gpt-4.1",
-    eval_model: str = "openai/gpt-4.1-mini",
+    optimizer_model: str = FREE_PRIMARY_MODEL,
+    eval_model: str = FREE_PRIMARY_MODEL,
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
@@ -87,9 +93,10 @@ def evolve(
         dataset = build_dataset_from_external(
             skill_name=skill_name,
             skill_text=skill["raw"],
-            sources=["claude-code", "copilot", "hermes"],
+            sources=["claude-code", "copilot", "hermes", "hermes-statedb"],
             output_path=save_path,
             model=eval_model,
+            max_examples=config.eval_dataset_size,
         )
         if not dataset.all_examples:
             console.print("[red]✗ No relevant examples found from session history[/red]")
@@ -118,7 +125,7 @@ def evolve(
     # ── 3. Validate constraints on baseline ─────────────────────────────
     console.print(f"\n[bold]Validating baseline constraints[/bold]")
     validator = ConstraintValidator(config)
-    baseline_constraints = validator.validate_all(skill["body"], "skill")
+    baseline_constraints = validator.validate_all(skill["raw"], "skill")
     all_pass = True
     for c in baseline_constraints:
         icon = "✓" if c.passed else "✗"
@@ -136,8 +143,10 @@ def evolve(
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
 
-    # Configure DSPy
-    lm = dspy.LM(eval_model)
+    # Configure DSPy — the openrouter/ route is a LiteLLM alias and needs the
+    # OpenAI-compatible endpoint explicitly, or dspy uses the provider default
+    # and the free route silently never carries the call.
+    lm = dspy.LM(eval_model, base_url=OPENROUTER_BASE_URL)
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -155,7 +164,8 @@ def evolve(
     try:
         optimizer = dspy.GEPA(
             metric=skill_fitness_metric,
-            max_steps=iterations,
+            max_full_evals=iterations,
+            reflection_lm=lm,
         )
 
         optimized_module = optimizer.compile(
@@ -185,7 +195,7 @@ def evolve(
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_body, "skill", baseline_text=skill["body"])
+    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -298,8 +308,8 @@ def evolve(
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
-@click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
+@click.option("--optimizer-model", default=FREE_PRIMARY_MODEL, help="Model for GEPA reflections (free route)")
+@click.option("--eval-model", default=FREE_PRIMARY_MODEL, help="Model for evaluations (free route)")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")

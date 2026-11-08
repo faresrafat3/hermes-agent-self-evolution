@@ -23,6 +23,7 @@ Usage from evolve_skill.py:
 """
 
 import json
+import os
 import re
 import random
 from pathlib import Path
@@ -416,6 +417,103 @@ class HermesSessionImporter:
         return messages
 
 
+# ── Hermes session database (state.db) ──────────────────────────────────────
+
+
+class HermesStateDbImporter:
+    """Import user/assistant pairs from the Hermes session database.
+
+    Hermes 0.23 stores transcripts in the SQLite session store (``state.db``)
+    rather than as per-session JSON files, so the file-based importer finds
+    nothing on a live profile. This reads the ``messages`` table read-only and
+    pairs each user message with the next assistant response in the same
+    session — the same shape as the other importers.
+    """
+
+    @staticmethod
+    def _state_db_path() -> Optional[Path]:
+        # The main Hermes session store is the real "sessiondb" (all profiles
+        # and sessions); the active profile's own store is only a fallback.
+        candidates = [Path.home() / ".hermes" / "state.db"]
+        hermes_home = os.getenv("HERMES_HOME")
+        if hermes_home:
+            profile_db = Path(hermes_home) / "state.db"
+            if profile_db != candidates[0]:
+                candidates.append(profile_db)
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    @staticmethod
+    def extract_messages(limit: int = 0) -> list[dict]:
+        """Read user/assistant pairs from the Hermes session store.
+
+        Args:
+            limit: Maximum messages to return (0 = no limit).
+
+        Returns:
+            List of dicts with keys: source, task_input, assistant_response,
+            session_id.
+        """
+        import sqlite3
+
+        path = HermesStateDbImporter._state_db_path()
+        if not path:
+            return []
+
+        try:
+            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return []
+
+        try:
+            rows = connection.execute(
+                "SELECT session_id, role, content FROM messages "
+                "WHERE role IN ('user', 'assistant') AND content IS NOT NULL "
+                "ORDER BY session_id, id"
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            connection.close()
+
+        by_session: dict[str, list[tuple[str, str]]] = {}
+        for session_id, role, content in rows:
+            if not isinstance(content, str):
+                continue
+            by_session.setdefault(str(session_id), []).append((role, content))
+
+        messages: list[dict] = []
+        for session_id, entries in by_session.items():
+            for index, (role, content) in enumerate(entries):
+                if role != "user":
+                    continue
+                user_text = content.strip()
+                if len(user_text) < 10 or _contains_secret(user_text):
+                    continue
+                assistant_text = ""
+                for cursor in range(index + 1, len(entries)):
+                    next_role, next_content = entries[cursor]
+                    if next_role == "assistant":
+                        if next_content.strip():
+                            assistant_text = next_content.strip()
+                        break
+                    if next_role == "user":
+                        break
+                if not assistant_text or _contains_secret(assistant_text):
+                    continue
+                messages.append({
+                    "source": "hermes",
+                    "task_input": user_text,
+                    "assistant_response": assistant_text,
+                    "session_id": session_id,
+                })
+                if limit and len(messages) >= limit:
+                    return messages
+        return messages
+
+
 # ── Relevance Filtering ───────────────────────────────────────────────────
 
 
@@ -633,6 +731,7 @@ def build_dataset_from_external(
         "claude-code": ("Claude Code", ClaudeCodeImporter),
         "copilot": ("Copilot", CopilotImporter),
         "hermes": ("Hermes Agent", HermesSessionImporter),
+        "hermes-statedb": ("Hermes Session DB", HermesStateDbImporter),
     }
 
     for source in sources:
