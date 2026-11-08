@@ -26,6 +26,7 @@ from evolution.core.config import (
     resolve_hermes_agent_path,
 )
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
+from evolution.core.dataset_split import balance_report, check_leakage
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
@@ -66,6 +67,67 @@ def build_reflection_lm(
         round_robin=round_robin,
         base_url=base_url,
     )
+
+
+def _score_split(module, examples, lm, metric) -> float:
+    """Mean ``metric`` over a split, running ``module`` under ``lm``."""
+    if not examples:
+        return 0.0
+    scores = []
+    for ex in examples:
+        with dspy.context(lm=lm):
+            pred = module(task_input=ex.task_input)
+            scores.append(metric(ex, pred))
+    return sum(scores) / len(scores)
+
+
+def acceptance_gate(
+    *,
+    val_before: float,
+    val_after: float,
+    holdout_before: float,
+    holdout_after: float,
+    budget_ok: bool,
+    holdout_tolerance: float = 0.0,
+) -> dict:
+    """Dual acceptance gate for an evolved skill.
+
+    A candidate is accepted only when BOTH hold:
+
+    1. ``budget_ok`` — the Ockham growth budget (``<= max_growth_ratio``)
+       holds after distillation.
+    2. ``holdout_after >= holdout_before - holdout_tolerance`` — the holdout
+       does not regress (non-negative generalization). ``holdout_tolerance``
+       is a small allowance for measurement noise; the default ``0.0``
+       demands strict non-negativity.
+
+    The gate is deliberately *dual*, not triple: the valset is GEPA's
+    **selection** criterion — it already chose the candidate for its val
+    score before distillation — so requiring the *distilled* artifact to also
+    improve on val conflates selection with deployment. Ockham distillation
+    legitimately trades selection-set verbosity for generalization: the
+    keyword-overlap val metric rewards a verbose candidate, and the distiller
+    removes exactly that verbosity, so val can fall while the balanced holdout
+    (the covariate-shift guard) improves. ``val_improved`` is therefore
+    reported as a diagnostic — it tells you what the distillation cost on the
+    selection set — but it does not block deployment. The holdout, which the
+    optimizer never saw, is the deployment criterion.
+
+    Returns a report dict with ``accepted`` and the per-condition booleans,
+    the deltas, and the tolerance used. The gate is a *decision*, not a
+    rewrite — a rejected candidate is still saved for inspection.
+    """
+    val_improved = val_after > val_before
+    holdout_ok = holdout_after >= holdout_before - holdout_tolerance
+    return {
+        "accepted": bool(budget_ok and holdout_ok),
+        "budget_ok": bool(budget_ok),
+        "val_improved": bool(val_improved),
+        "holdout_nonnegative": bool(holdout_ok),
+        "val_delta": val_after - val_before,
+        "holdout_delta": holdout_after - holdout_before,
+        "holdout_tolerance": holdout_tolerance,
+    }
 
 
 def evolve(
@@ -150,6 +212,15 @@ def evolve(
         sys.exit(1)
 
     console.print(f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / {len(dataset.holdout)} holdout")
+    split_balance = balance_report(
+        dataset.train, dataset.val, dataset.holdout, len(dataset.all_examples)
+    )
+    split_leakage = check_leakage(dataset.train, dataset.val, dataset.holdout)
+    console.print(
+        f"  Split balance: max stratum deviation "
+        f"{split_balance['max_stratum_deviation']:.3f}, leakage "
+        f"{split_leakage if split_leakage else 'none'}"
+    )
 
     # ── 3. Validate constraints on baseline ─────────────────────────────
     console.print(f"\n[bold]Validating baseline constraints[/bold]")
@@ -298,27 +369,41 @@ def evolve(
         console.print(f"  Saved failed variant to {output_path}")
         return
 
-    # ── 8. Evaluate on holdout set ──────────────────────────────────────
-    console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
-
+    # ── 8. Evaluate on val + holdout and apply the dual acceptance gate ──
+    # The valset carried GEPA's acceptance signal during optimization; the
+    # holdout is the untouched generalization check. Scoring both, before and
+    # after, lets the dual gate refuse a candidate that overfits the
+    # train/val distribution and regresses on the balanced holdout.
+    val_examples = dataset.to_dspy_examples("val")
     holdout_examples = dataset.to_dspy_examples("holdout")
 
-    baseline_scores = []
-    evolved_scores = []
-    for ex in holdout_examples:
-        # Score baseline
-        with dspy.context(lm=task_lm):
-            baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
-            baseline_scores.append(baseline_score)
+    console.print(
+        f"\n[bold]Scoring val ({len(val_examples)} examples) and holdout "
+        f"({len(holdout_examples)} examples) before/after[/bold]"
+    )
+    val_baseline = _score_split(baseline_module, val_examples, task_lm, skill_fitness_metric)
+    val_evolved = _score_split(optimized_module, val_examples, task_lm, skill_fitness_metric)
+    holdout_baseline = _score_split(baseline_module, holdout_examples, task_lm, skill_fitness_metric)
+    holdout_evolved = _score_split(optimized_module, holdout_examples, task_lm, skill_fitness_metric)
 
-            evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
-            evolved_scores.append(evolved_score)
+    avg_baseline = holdout_baseline
+    avg_evolved = holdout_evolved
+    improvement = holdout_evolved - holdout_baseline
 
-    avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
-    avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
-    improvement = avg_evolved - avg_baseline
+    budget_ok = ockham_report["after_growth"] <= ockham_report["max_growth_ratio"]
+    gate = acceptance_gate(
+        val_before=val_baseline,
+        val_after=val_evolved,
+        holdout_before=holdout_baseline,
+        holdout_after=holdout_evolved,
+        budget_ok=budget_ok,
+    )
+    console.print(
+        f"  Dual gate: budget_ok={gate['budget_ok']} "
+        f"val_improved={gate['val_improved']} ({gate['val_delta']:+.3f}) "
+        f"holdout_nonnegative={gate['holdout_nonnegative']} "
+        f"({gate['holdout_delta']:+.3f}) -> accepted={gate['accepted']}"
+    )
 
     # ── 9. Report results ───────────────────────────────────────────────
     table = Table(title="Evolution Results")
@@ -328,11 +413,24 @@ def evolve(
     table.add_column("Change", justify="right")
 
     change_color = "green" if improvement > 0 else "red"
+    val_color = "green" if gate["val_delta"] > 0 else "red"
+    table.add_row(
+        "Val Score",
+        f"{val_baseline:.3f}",
+        f"{val_evolved:.3f}",
+        f"[{val_color}]{gate['val_delta']:+.3f}[/{val_color}]",
+    )
     table.add_row(
         "Holdout Score",
         f"{avg_baseline:.3f}",
         f"{avg_evolved:.3f}",
         f"[{change_color}]{improvement:+.3f}[/{change_color}]",
+    )
+    table.add_row(
+        "Dual Gate",
+        "—",
+        "accepted" if gate["accepted"] else "rejected",
+        f"budget={gate['budget_ok']} val↑={gate['val_improved']} hold≥0={gate['holdout_nonnegative']}",
     )
     table.add_row(
         "Skill Size",
@@ -367,11 +465,24 @@ def evolve(
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
+        "val_baseline_score": val_baseline,
+        "val_evolved_score": val_evolved,
+        "val_improvement": gate["val_delta"],
+        "holdout_baseline_score": holdout_baseline,
+        "holdout_evolved_score": holdout_evolved,
+        "holdout_improvement": improvement,
+        "dual_gate_accepted": gate["accepted"],
+        "dual_gate_budget_ok": gate["budget_ok"],
+        "dual_gate_val_improved": gate["val_improved"],
+        "dual_gate_holdout_nonnegative": gate["holdout_nonnegative"],
+        "dual_gate_holdout_tolerance": gate["holdout_tolerance"],
         "baseline_size": len(skill["body"]),
         "evolved_size": len(evolved_body),
         "train_examples": len(dataset.train),
         "val_examples": len(dataset.val),
         "holdout_examples": len(dataset.holdout),
+        "split_balance_max_stratum_deviation": split_balance["max_stratum_deviation"],
+        "split_leakage": split_leakage,
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
         "ockham_applied": ockham_report["applied"],

@@ -126,6 +126,14 @@ class EvolutionConfig:
     train_ratio: float = 0.5
     val_ratio: float = 0.25
     holdout_ratio: float = 0.25
+    # Deterministic stratified splitting (evolution.core.dataset_split): the
+    # split is seeded, balanced on difficulty / input-length / task family,
+    # and guaranteed leak-free, so the same examples and ratios always yield
+    # the same train/val/holdout membership. min_holdout_examples is a floor
+    # enforced by moving examples from train when the ratio default would
+    # make the holdout too small to measure generalization on.
+    split_seed: int = 0
+    min_holdout_examples: int = 0  # Floor on holdout size (0 = ratio default)
 
     # Benchmark gating
     # Off by default: on a free route every loop iteration would re-run the

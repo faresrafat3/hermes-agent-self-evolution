@@ -35,6 +35,7 @@ from rich.console import Console
 from rich.progress import Progress
 
 from evolution.core.dataset_builder import EvalExample, EvalDataset
+from evolution.core.dataset_split import stratified_split
 from evolution.core.openrouter_rotation import make_rotating_lm
 
 console = Console()
@@ -768,17 +769,19 @@ def build_dataset_from_external(
             f"recommended for meaningful train/val/holdout split)[/yellow]"
         )
 
-    # Split into train/val/holdout (50/25/25)
-    random.shuffle(examples)
-    n = len(examples)
-    n_train = max(1, int(n * 0.5))
-    n_val = max(1, int(n * 0.25))
-
-    dataset = EvalDataset(
-        train=examples[:n_train],
-        val=examples[n_train:n_train + n_val],
-        holdout=examples[n_train + n_val:],
+    # Split into train/val/holdout (50/25/25) — stratified, deterministic,
+    # and leak-free (see evolution.core.dataset_split). The mined set used to
+    # go through random.shuffle + contiguous chunks, which put one verbatim
+    # task_input in both train and holdout for the github skill.
+    result = stratified_split(
+        examples,
+        train_ratio=0.5,
+        val_ratio=0.25,
+        holdout_ratio=0.25,
+        seed=0,
+        dedupe=True,
     )
+    dataset = EvalDataset(**result.dataset_kwargs)
 
     dataset.save(output_path)
     console.print(f"\n[bold]Saved to {output_path}/[/bold]")

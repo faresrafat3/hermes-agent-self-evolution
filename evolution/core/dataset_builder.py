@@ -7,7 +7,7 @@ C) Golden sets — hand-curated JSONL files
 """
 
 import json
-import random
+import math
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -15,6 +15,7 @@ from typing import Optional
 import dspy
 
 from evolution.core.config import EvolutionConfig
+from evolution.core.dataset_split import normalize_task, stratified_split
 from evolution.core.openrouter_rotation import make_rotating_lm
 
 
@@ -87,6 +88,23 @@ class EvalDataset:
         ]
 
 
+def _parse_test_cases(raw: str) -> list[dict]:
+    """Parse the judge's JSON array of test cases, tolerating wrapped output."""
+    try:
+        cases = json.loads(raw)
+        if isinstance(cases, list):
+            return cases
+    except json.JSONDecodeError:
+        pass
+    import re
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        cases = json.loads(match.group())
+        if isinstance(cases, list):
+            return cases
+    raise ValueError(f"Could not parse test cases from LLM output: {raw[:200]}")
+
+
 class SyntheticDatasetBuilder:
     """Generate evaluation datasets using a strong LLM.
 
@@ -103,10 +121,18 @@ class SyntheticDatasetBuilder:
         - An expected_behavior rubric (what a good response should contain/do, NOT exact text)
         - A difficulty level (easy, medium, hard)
         - A category (what aspect of the skill this tests)
+
+        The ``focus`` field names the aspect this batch should emphasize. It
+        exists because batched generation must receive a *different* prompt
+        per batch: an identical prompt is served from DSPy's result cache, so
+        every batch after the first comes back as a verbatim copy of the first
+        and the dedupe step then collapses the whole dataset back down to one
+        batch.
         """
         artifact_text: str = dspy.InputField(desc="The full text of the skill/tool/prompt being tested")
         artifact_type: str = dspy.InputField(desc="Type: 'skill', 'tool_description', or 'prompt_section'")
         num_cases: int = dspy.InputField(desc="Number of test cases to generate")
+        focus: str = dspy.InputField(desc="Specific aspect to emphasize in this batch (e.g. 'authentication setup', 'PR creation', 'edge cases', 'general coverage'). Vary this across batches so batched generation yields diverse, non-repeated cases.")
         test_cases: str = dspy.OutputField(desc="JSON array of test cases, each with: task_input, expected_behavior, difficulty, category")
 
     def __init__(self, config: EvolutionConfig):
@@ -119,8 +145,17 @@ class SyntheticDatasetBuilder:
         artifact_type: str = "skill",
         num_cases: Optional[int] = None,
     ) -> EvalDataset:
-        """Generate a full eval dataset with train/val/holdout splits."""
+        """Generate a full eval dataset with train/val/holdout splits.
 
+        Cases are generated in batches of ``BATCH_CASES``: asking the judge
+        for a large ``num_cases`` in a single call yields truncated or
+        degenerate JSON, so a big target (the "expand the available sample"
+        option) is built from several compliant calls. The pool is deduped
+        and split with :func:`evolution.core.dataset_split.stratified_split`
+        — stratified by difficulty / input-length / task family, deterministic
+        by ``config.split_seed``, and guarded against train/val/holdout
+        leakage.
+        """
         n = num_cases or self.config.eval_dataset_size
 
         # Configure DSPy to use the judge model for generation
@@ -136,48 +171,66 @@ class SyntheticDatasetBuilder:
             round_robin=getattr(self.config, "openrouter_round_robin", True),
         )
 
-        with dspy.context(lm=lm):
-            result = self.generator(
-                artifact_text=artifact_text,
-                artifact_type=artifact_type,
-                num_cases=n,
-            )
-
-        # Parse the generated test cases
-        try:
-            cases_raw = json.loads(result.test_cases)
-        except json.JSONDecodeError:
-            # Try to extract JSON from the response
-            import re
-            match = re.search(r'\[.*\]', result.test_cases, re.DOTALL)
-            if match:
-                cases_raw = json.loads(match.group())
-            else:
-                raise ValueError(f"Could not parse test cases from LLM output: {result.test_cases[:200]}")
-
-        examples = [
-            EvalExample(
-                task_input=c.get("task_input", ""),
-                expected_behavior=c.get("expected_behavior", ""),
-                difficulty=c.get("difficulty", "medium"),
-                category=c.get("category", "general"),
-                source="synthetic",
-            )
-            for c in cases_raw
-            if c.get("task_input") and c.get("expected_behavior")
+        examples: list[EvalExample] = []
+        seen: set[str] = set()
+        batch = 15
+        # Rotating emphases so each batch produces a different slice of the
+        # artifact's surface instead of a cached copy of the first batch: an
+        # identical prompt is served from DSPy's result cache, which would
+        # hand back a verbatim copy that the dedupe step then collapses.
+        _foci = [
+            "general coverage of the artifact's main workflows",
+            "authentication, setup, and configuration",
+            "creating and managing issues, milestones, and labels",
+            "pull-request creation and update workflows",
+            "code review and reviewer feedback",
+            "merging, closing, releasing, and versioning",
+            "edge cases, errors, and failure modes",
+            "API fallback and tool-preference decisions",
         ]
+        # Tolerate a short batch with a bounded number of extra attempts;
+        # never loop forever on a judge that keeps coming up short.
+        max_attempts = max(1, math.ceil(n / batch) + 2)
+        for attempt in range(max_attempts):
+            if len(examples) >= n:
+                break
+            want = min(batch, n - len(examples))
+            with dspy.context(lm=lm):
+                result = self.generator(
+                    artifact_text=artifact_text,
+                    artifact_type=artifact_type,
+                    num_cases=want,
+                    focus=_foci[attempt % len(_foci)],
+                )
+            for c in _parse_test_cases(result.test_cases):
+                task_input = c.get("task_input", "")
+                expected_behavior = c.get("expected_behavior", "")
+                if not task_input or not expected_behavior:
+                    continue
+                key = normalize_task(task_input)
+                if key in seen:
+                    continue
+                seen.add(key)
+                examples.append(
+                    EvalExample(
+                        task_input=task_input,
+                        expected_behavior=expected_behavior,
+                        difficulty=c.get("difficulty", "medium"),
+                        category=c.get("category", "general"),
+                        source="synthetic",
+                    )
+                )
 
-        # Shuffle and split
-        random.shuffle(examples)
-        n_total = len(examples)
-        n_train = max(1, int(n_total * self.config.train_ratio))
-        n_val = max(1, int(n_total * self.config.val_ratio))
-
-        return EvalDataset(
-            train=examples[:n_train],
-            val=examples[n_train:n_train + n_val],
-            holdout=examples[n_train + n_val:],
+        result = stratified_split(
+            examples,
+            train_ratio=self.config.train_ratio,
+            val_ratio=self.config.val_ratio,
+            holdout_ratio=self.config.holdout_ratio,
+            seed=self.config.split_seed,
+            dedupe=True,
+            min_holdout=self.config.min_holdout_examples,
         )
+        return EvalDataset(**result.dataset_kwargs)
 
 
 class GoldenDatasetLoader:
@@ -200,13 +253,12 @@ class GoldenDatasetLoader:
                 if line.strip():
                     examples.append(EvalExample.from_dict(json.loads(line)))
 
-        random.shuffle(examples)
-        n = len(examples)
-        n_train = max(1, int(n * 0.5))
-        n_val = max(1, int(n * 0.25))
-
-        return EvalDataset(
-            train=examples[:n_train],
-            val=examples[n_train:n_train + n_val],
-            holdout=examples[n_train + n_val:],
+        result = stratified_split(
+            examples,
+            train_ratio=0.5,
+            val_ratio=0.25,
+            holdout_ratio=0.25,
+            seed=0,
+            dedupe=True,
         )
+        return EvalDataset(**result.dataset_kwargs)
