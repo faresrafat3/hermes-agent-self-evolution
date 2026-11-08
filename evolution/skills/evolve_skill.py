@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, cast
 
 import click
 import dspy
@@ -31,9 +31,9 @@ from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
+    extract_skill_markdown,
     load_skill,
     find_skill,
-    reassemble_skill,
 )
 
 console = Console()
@@ -149,8 +149,14 @@ def evolve(
     lm = dspy.LM(eval_model, base_url=OPENROUTER_BASE_URL)
     dspy.configure(lm=lm)
 
-    # Create the baseline skill module
-    baseline_module = SkillModule(skill["body"])
+    # Create the baseline skill module. The skill body becomes the predictor's
+    # signature instructions -- the text GEPA evolves -- while the original
+    # frontmatter/raw text are kept so the evolved file can be reassembled.
+    baseline_module = SkillModule(
+        skill["body"],
+        frontmatter=skill["frontmatter"],
+        raw_skill=skill["raw"],
+    )
 
     # Prepare DSPy examples
     trainset = dataset.to_dspy_examples("train")
@@ -189,9 +195,12 @@ def evolve(
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
     # ── 6. Extract evolved skill text ───────────────────────────────────
-    # The optimized module's instructions contain the evolved skill text
-    evolved_body = optimized_module.skill_text
-    evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
+    # GEPA writes the evolved instructions back into the predictor signature
+    # (pred.signature = pred.signature.with_instructions(...)), so read the body
+    # from there and reassemble the file with the original frontmatter when the
+    # instructions changed.
+    evolved_body = cast(SkillModule, optimized_module).skill_text
+    evolved_full = extract_skill_markdown(cast(SkillModule, optimized_module))
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
