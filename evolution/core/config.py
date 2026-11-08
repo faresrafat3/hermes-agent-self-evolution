@@ -5,6 +5,62 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
+# The self-evolution runtime is configured to spend zero money: it runs on the
+# free models already enabled on this machine. The API keys live in the Hermes
+# profile .env, which a bare venv does not read — load it once, without
+# overriding anything the caller already exported.
+_HERMES_ENV_LOADED = False
+
+
+def _load_hermes_env() -> None:
+    global _HERMES_ENV_LOADED
+    if _HERMES_ENV_LOADED:
+        return
+    _HERMES_ENV_LOADED = True
+    candidates = []
+    hermes_home = os.getenv("HERMES_HOME")
+    if hermes_home:
+        candidates.append(Path(hermes_home) / ".env")
+    candidates.append(Path.home() / ".hermes" / ".env")
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            for raw_line in path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        except OSError:
+            continue
+
+
+_load_hermes_env()
+
+
+# Free model routes (zero financial cost). OpenRouter is primary.
+#
+# There is no second free route provisioned on this machine: the account has no
+# OpenRouter credits for paid routes, and the other `:free` candidates are
+# either not valid model IDs (meituan/longcat-2.5) or not free on this account
+# (gpt-4o-mini). The Nous endpoint cannot serve as a fallback either — it needs
+# an OPENAI_API_KEY, and only OPENROUTER_API_KEY exists here.
+#
+# So the fallback is intentionally a DIFFERENT free model on the same working
+# route, not a different provider. If the primary model is rate-limited or
+# retired, the caller can override it explicitly with --optimizer-model /
+# --eval-model.
+FREE_PRIMARY_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+FREE_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+# The openrouter/ prefix is a LiteLLM route: it must be told where the OpenAI-
+# compatible endpoint lives, otherwise dspy falls back to the provider default
+# and the key in the Hermes .env is never used. Kept overridable by the caller.
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
 
 @dataclass
 class EvolutionConfig:
@@ -20,10 +76,11 @@ class EvolutionConfig:
     iterations: int = 10
     population_size: int = 5
 
-    # LLM configuration
-    optimizer_model: str = "openai/gpt-4.1"  # Model for GEPA reflections
-    eval_model: str = "openai/gpt-4.1-mini"  # Model for LLM-as-judge scoring
-    judge_model: str = "openai/gpt-4.1"  # Model for dataset generation
+    # LLM configuration — free models only (zero financial cost).
+    optimizer_model: str = FREE_PRIMARY_MODEL  # Model for GEPA reflections
+    eval_model: str = FREE_PRIMARY_MODEL  # Model for LLM-as-judge scoring
+    judge_model: str = FREE_PRIMARY_MODEL  # Model for dataset generation
+    fallback_models: list = field(default_factory=lambda: [FREE_FALLBACK_MODEL])
 
     # Constraints
     max_skill_size: int = 15_000  # 15KB default
@@ -32,13 +89,16 @@ class EvolutionConfig:
     max_prompt_growth: float = 0.2  # 20% max growth over baseline
 
     # Eval dataset
-    eval_dataset_size: int = 20  # Total examples to generate
+    eval_dataset_size: int = 15  # Total examples to generate (small: free models + rate limits)
     train_ratio: float = 0.5
     val_ratio: float = 0.25
     holdout_ratio: float = 0.25
 
     # Benchmark gating
-    run_pytest: bool = True
+    # Off by default: on a free route every loop iteration would re-run the
+    # hermes-agent pytest suite, burning the rate limit for a gate that a
+    # skill-text evolution cannot affect. Opt in with --run-tests.
+    run_pytest: bool = False
     run_tblite: bool = False  # Expensive — opt-in
     tblite_regression_threshold: float = 0.02  # Max 2% regression allowed
 
