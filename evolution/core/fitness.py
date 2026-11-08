@@ -104,16 +104,25 @@ class LLMJudge:
         )
 
 
-def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
+def skill_fitness_metric(
+    gold: dspy.Example,
+    pred: dspy.Prediction,
+    trace=None,
+    pred_name: Optional[str] = None,
+    pred_trace=None,
+) -> float:
     """DSPy-compatible metric function for skill optimization.
 
-    This is what gets passed to dspy.GEPA(metric=...).
+    This is what gets passed to dspy.GEPA(metric=...). GEPA calls the metric as
+    ``(gold, pred, trace, pred_name, pred_trace)`` while MIPROv2 calls it as
+    ``(example, prediction, trace)``; the five-argument signature satisfies
+    both, so the GEPA path no longer falls back.
     Returns a float 0-1 score.
     """
     # The prediction should have an 'output' field with the agent's response
-    agent_output = getattr(prediction, "output", "") or ""
-    expected = getattr(example, "expected_behavior", "") or ""
-    task = getattr(example, "task_input", "") or ""
+    agent_output = getattr(pred, "output", "") or ""
+    expected = getattr(gold, "expected_behavior", "") or ""
+    task = getattr(gold, "task_input", "") or ""
 
     if not agent_output.strip():
         return 0.0
